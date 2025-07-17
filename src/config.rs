@@ -15,7 +15,7 @@ pub(crate) const VECTOR_CHUNK_SIZE: usize = 64;
 #[cfg(feature = "small-chunks")]
 pub(crate) const ORD_CHUNK_SIZE: usize = 6;
 #[cfg(not(feature = "small-chunks"))]
-pub(crate) const ORD_CHUNK_SIZE: usize = 64;
+pub(crate) const ORD_CHUNK_SIZE: usize = 32;
 
 /// The level size of HAMTs, in bits
 /// Branching factor is 2 ^ HashLevelSize.

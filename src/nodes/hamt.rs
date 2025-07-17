@@ -435,6 +435,18 @@ impl<A: HashValue> CollisionNode<A> {
     }
 }
 
+impl<A, P: SharedPointerKind> Node<A, P> {
+    /// Analyze the node structure for debugging/statistics
+    pub(crate) fn analyze_structure<F>(&self, mut visitor: F)
+    where
+        F: FnMut(&Entry<A, P>),
+    {
+        for i in self.data.indices() {
+            visitor(&self.data[i]);
+        }
+    }
+}
+
 /// An allocation-free stack for iterators.
 type InlineStack<T> = InlineArray<T, (usize, [T; ITER_STACK_CAPACITY])>;
 
