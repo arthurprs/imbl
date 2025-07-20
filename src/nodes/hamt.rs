@@ -44,12 +44,14 @@ pub trait HashValue {
 }
 
 pub(crate) struct Node<A, P: SharedPointerKind> {
+    collisions: bitmaps::Bitmap<HASH_WIDTH>,
     data: SparseChunk<Entry<A, P>, HASH_WIDTH>,
 }
 
 impl<A: Clone, P: SharedPointerKind> Clone for Node<A, P> {
     fn clone(&self) -> Self {
         Self {
+            collisions: self.collisions.clone(),
             data: self.data.clone(),
         }
     }
@@ -106,6 +108,7 @@ impl<A, P: SharedPointerKind> Node<A, P> {
     #[inline(always)]
     pub(crate) fn new() -> Self {
         Node {
+            collisions: bitmaps::Bitmap::new(),
             data: SparseChunk::new(),
         }
     }
@@ -180,25 +183,23 @@ impl<A: HashValue, P: SharedPointerKind> Node<A, P> {
         shift: usize,
     ) -> SharedPointer<Self, P> {
         let index1 = mask(hash1, shift) as usize;
-        let index2 = mask(hash2, shift) as usize;
-        if index1 != index2 {
-            // Both values fit on the same level.
-            Node::pair(
-                index1,
-                Entry::Value(value1, hash1),
-                index2,
-                Entry::Value(value2, hash2),
-            )
-        } else if shift + HASH_SHIFT >= HASH_WIDTH {
+        let mut index2 = mask(hash2, shift) as usize;
+        if shift + HASH_SHIFT >= HASH_WIDTH && index1 == index2 {
             // If we're at the bottom, we've got a collision.
             Node::unit(
                 index1,
                 Entry::from(CollisionNode::new(hash1, value1, value2)),
             )
         } else {
-            // Pass the values down a level.
-            let node = Node::merge_values(value1, hash1, value2, hash2, shift + HASH_SHIFT);
-            Node::single_child(index1, node)
+            if index1 == index2 {
+                index2 = (index1 + 1) % HASH_WIDTH;
+            }
+            Node::pair(
+                index1,
+                Entry::Value(value1, hash1),
+                index2,
+                Entry::Value(value2, hash2),
+            )
         }
     }
 
@@ -207,22 +208,24 @@ impl<A: HashValue, P: SharedPointerKind> Node<A, P> {
         BK: Eq + ?Sized,
         A::Key: Borrow<BK>,
     {
-        let index = mask(hash, shift) as usize;
-        if let Some(entry) = self.data.get(index) {
-            match entry {
+        let mut index = mask(hash, shift) as usize;
+        while let Some(entry) = self.data.get(index) {
+            return match entry {
                 Entry::Value(ref value, _) => {
                     if key == value.extract_key().borrow() {
                         Some(value)
-                    } else {
+                    } else if self.collisions.is_full() {
                         None
+                    } else {
+                        index = (index + 1) % HASH_WIDTH;
+                        continue;
                     }
                 }
                 Entry::Collision(ref coll) => coll.get(key),
                 Entry::Node(ref child) => child.get(hash, shift + HASH_SHIFT, key),
-            }
-        } else {
-            None
+            };
         }
+        None
     }
 
     pub(crate) fn get_mut<BK>(&mut self, hash: HashBits, shift: usize, key: &BK) -> Option<&mut A>
@@ -255,23 +258,27 @@ impl<A: HashValue, P: SharedPointerKind> Node<A, P> {
         }
     }
 
+    #[allow(unsafe_code)]
     pub(crate) fn insert(&mut self, hash: HashBits, shift: usize, value: A) -> Option<A>
     where
         A: Clone,
     {
-        let index = mask(hash, shift) as usize;
-        if let Some(entry) = self.data.get_mut(index) {
-            let mut fallthrough = false;
+        let mut index = mask(hash, shift) as usize;
+        let initial_index = index;
+        let len = self.data.len();
+        while let Some(entry) = self.data.get_mut(index) {
             // Value is here
             match entry {
                 // Update value or create a subtree
-                Entry::Value(ref current, _) => {
-                    if current.extract_key() == value.extract_key() {
-                        // If we have a key match, fall through to the outer
-                        // level where we replace the current value. If we
-                        // don't, fall through to the inner level where we merge
-                        // some nodes.
-                        fallthrough = true;
+                Entry::Value(ref mut current, current_hash) => {
+                    if (!mem::needs_drop::<A>() || *current_hash == hash)
+                        && current.extract_key() == value.extract_key()
+                    {
+                        return Some(mem::replace(current, value));
+                    }
+                    if !self.collisions.is_full() {
+                        index = (index + 1) % HASH_WIDTH;
+                        continue;
                     }
                 }
                 // There's already a collision here.
@@ -285,26 +292,44 @@ impl<A: HashValue, P: SharedPointerKind> Node<A, P> {
                     return child.insert(hash, shift + HASH_SHIFT, value);
                 }
             }
-            #[allow(unsafe_code)]
-            if !fallthrough {
-                // If we get here, we're looking at a value entry that needs a merge.
-                // We're going to be unsafe and pry it out of the reference, trusting
-                // that we overwrite it with the merged node.
-                let old_entry = unsafe { ptr::read(entry) };
-                if shift + HASH_SHIFT >= HASH_WIDTH {
-                    // We're at the lowest level, need to set up a collision node.
-                    let coll = CollisionNode::new(hash, old_entry.unwrap_value(), value);
-                    unsafe { ptr::write(entry, Entry::from(coll)) };
-                } else if let Entry::Value(old_value, old_hash) = old_entry {
-                    let node =
-                        Node::merge_values(old_value, old_hash, value, hash, shift + HASH_SHIFT);
-                    unsafe { ptr::write(entry, Entry::Node(node)) };
-                } else {
-                    unreachable!()
-                }
-                return None;
+            // If we get here, we're looking at a value entry that needs a merge.
+            // We're going to be unsafe and pry it out of the reference, trusting
+            // that we overwrite it with the merged node.
+            let old_entry = unsafe { ptr::read(entry) };
+            if shift + HASH_SHIFT >= HASH_WIDTH {
+                // We're at the lowest level, need to set up a collision node.
+                let coll = CollisionNode::new(hash, old_entry.unwrap_value(), value);
+                unsafe { ptr::write(entry, Entry::from(coll)) };
+            } else if let Entry::Value(old_value, old_hash) = old_entry {
+                let node = Node::merge_values(old_value, old_hash, value, hash, shift + HASH_SHIFT);
+                unsafe { ptr::write(entry, Entry::Node(node)) };
+            } else {
+                unreachable!()
             }
+            return None;
         }
+
+        // dbg!(index, initial_index, shift, len, self.collisions.is_full());
+        if index != initial_index && len >= HASH_WIDTH / 2 {
+            self.collisions = bitmaps::Bitmap::mask(HASH_WIDTH);
+            assert!(self.collisions.is_full());
+            let old_data = mem::take(&mut self.data);
+            for (i, entry) in old_data.option_drain().enumerate() {
+                let Some(entry) = entry else {
+                    continue;
+                };
+                match entry {
+                    Entry::Value(value, hash) => {
+                        self.insert(hash, shift, value);
+                    }
+                    entry => {
+                        self.data.insert(i, entry);
+                    }
+                }
+            }
+            return self.insert(hash, shift, value);
+        }
+
         // If we get here, either we found nothing at this index, in which case
         // we insert a new entry, or we hit a value entry with the same key, in
         // which case we replace it.

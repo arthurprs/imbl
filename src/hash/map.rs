@@ -2522,6 +2522,7 @@ fn main() {
         
         // Insert entries
         for i in 0..size {
+            // dbg!(i);
             map.insert(i, i * 2);
         }
         
