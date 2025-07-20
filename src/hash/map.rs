@@ -327,18 +327,20 @@ impl<K, V, S, P: SharedPointerKind> GenericHashMap<K, V, S, P> {
     /// This includes the number of nodes at each level and the distribution of child types.
     pub fn print_structure_summary(&self) {
         use std::collections::VecDeque;
+
+        println!("HashMap Structure Summary:");
         
         #[derive(Default, Debug)]
         struct LevelStats {
             node_count: usize,
             value_count: usize,
             collision_count: usize,
+            collision_entry_sum: usize,
             child_node_count: usize,
             total_entries: usize,
         }
         
         if self.root.is_none() {
-            println!("HashMap Structure Summary:");
             println!("  Empty HashMap (no root node)");
             println!("  Total entries: 0");
             return;
@@ -367,7 +369,10 @@ impl<K, V, S, P: SharedPointerKind> GenericHashMap<K, V, S, P> {
                 stats.total_entries += 1;
                 match entry {
                     NodeEntry::Value(_, _) => stats.value_count += 1,
-                    NodeEntry::Collision(_) => stats.collision_count += 1,
+                    NodeEntry::Collision(coll) => {
+                        stats.collision_count += 1;
+                        // stats.collision_entry_sum += coll.len();
+                    }
                     NodeEntry::Node(child_node) => {
                         stats.child_node_count += 1;
                         queue.push_back((level + 1, child_node.clone()));
@@ -377,7 +382,6 @@ impl<K, V, S, P: SharedPointerKind> GenericHashMap<K, V, S, P> {
         }
         
         // Print the summary
-        println!("HashMap Structure Summary:");
         println!("  Hash level size (bits): {}", crate::config::HASH_LEVEL_SIZE);
         println!("  Branching factor: {}", 2_usize.pow(crate::config::HASH_LEVEL_SIZE as u32));
         println!("  Total entries: {}", self.size);
@@ -397,8 +401,13 @@ impl<K, V, S, P: SharedPointerKind> GenericHashMap<K, V, S, P> {
                     stats.value_count,
                     (stats.value_count as f64 / stats.total_entries as f64) * 100.0
                 );
-                println!("      Collisions: {} ({:.1}%)", 
+                println!("      Collisions: {} (avg len: {:.1}) ({:.1}%)", 
                     stats.collision_count,
+                    if stats.collision_count > 0 {
+                        stats.collision_entry_sum as f64 / stats.collision_count as f64
+                    } else {
+                        0.0
+                    },
                     (stats.collision_count as f64 / stats.total_entries as f64) * 100.0
                 );
                 println!("      Child nodes: {} ({:.1}%)", 
@@ -1831,11 +1840,15 @@ where
     P: SharedPointerKind,
 {
     fn fmt(&self, f: &mut Formatter<'_>) -> Result<(), Error> {
-        let mut d = f.debug_map();
-        for (k, v) in self {
-            d.entry(k, v);
-        }
-        d.finish()
+        // let mut d = f.debug_map();
+        // for (k, v) in self {
+        //     d.entry(k, v);
+        // }
+        // d.finish()
+        f.debug_struct("GenericHashMap")
+            .field("size", &self.size)
+            .field("root", &self.root)
+            .finish()
     }
 }
 
@@ -2394,7 +2407,7 @@ mod test {
         fn lookup(ref m in collection::hash_map(i16::ANY, i16::ANY, 0..100)) {
             let map: HashMap<i16, i16> = FromIterator::from_iter(m.iter().map(|(k, v)| (*k, *v)));
             for (k, v) in m {
-                assert_eq!(Some(*v), map.get(k).cloned());
+                assert_eq!(Some(*v), map.get(k).cloned(), "{k} not found in map {map:?}");
             }
         }
 
