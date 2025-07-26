@@ -44,14 +44,14 @@ pub trait HashValue {
 }
 
 pub(crate) struct Node<A, P: SharedPointerKind> {
-    collisions: bitmaps::Bitmap<HASH_WIDTH>,
+    inline_collisions: bool,
     data: SparseChunk<Entry<A, P>, HASH_WIDTH>,
 }
 
 impl<A: Clone, P: SharedPointerKind> Clone for Node<A, P> {
     fn clone(&self) -> Self {
         Self {
-            collisions: self.collisions.clone(),
+            inline_collisions: self.inline_collisions.clone(),
             data: self.data.clone(),
         }
     }
@@ -108,7 +108,7 @@ impl<A, P: SharedPointerKind> Node<A, P> {
     #[inline(always)]
     pub(crate) fn new() -> Self {
         Node {
-            collisions: bitmaps::Bitmap::new(),
+            inline_collisions: true,
             data: SparseChunk::new(),
         }
     }
@@ -214,7 +214,7 @@ impl<A: HashValue, P: SharedPointerKind> Node<A, P> {
                 Entry::Value(ref value, _) => {
                     if key == value.extract_key().borrow() {
                         Some(value)
-                    } else if self.collisions.is_full() {
+                    } else if !self.inline_collisions {
                         None
                     } else {
                         index = (index + 1) % HASH_WIDTH;
@@ -276,7 +276,7 @@ impl<A: HashValue, P: SharedPointerKind> Node<A, P> {
                     {
                         return Some(mem::replace(current, value));
                     }
-                    if !self.collisions.is_full() {
+                    if self.inline_collisions {
                         index = (index + 1) % HASH_WIDTH;
                         continue;
                     }
@@ -311,8 +311,7 @@ impl<A: HashValue, P: SharedPointerKind> Node<A, P> {
 
         // dbg!(index, initial_index, shift, len, self.collisions.is_full());
         if index != initial_index && len >= HASH_WIDTH / 2 {
-            self.collisions = bitmaps::Bitmap::mask(HASH_WIDTH);
-            assert!(self.collisions.is_full());
+            self.inline_collisions = false;
             let old_data = mem::take(&mut self.data);
             for (i, entry) in old_data.option_drain().enumerate() {
                 let Some(entry) = entry else {
@@ -329,6 +328,8 @@ impl<A: HashValue, P: SharedPointerKind> Node<A, P> {
             }
             return self.insert(hash, shift, value);
         }
+
+        self.inline_collisions |= index != initial_index;
 
         // If we get here, either we found nothing at this index, in which case
         // we insert a new entry, or we hit a value entry with the same key, in
