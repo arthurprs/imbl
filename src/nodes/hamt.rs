@@ -44,7 +44,11 @@ pub trait HashValue {
 }
 
 pub(crate) struct Node<A, P: SharedPointerKind> {
+    /// Whether this node is using inline collisions.
+    /// When true it uses linear probing to resolve collisions,
+    /// and the child nodes are always `Value`s.
     inline_collisions: bool,
+    solving_collisions: bool,
     data: SparseChunk<Entry<A, P>, HASH_WIDTH>,
 }
 
@@ -52,6 +56,7 @@ impl<A: Clone, P: SharedPointerKind> Clone for Node<A, P> {
     fn clone(&self) -> Self {
         Self {
             inline_collisions: self.inline_collisions.clone(),
+            solving_collisions: self.solving_collisions.clone(),
             data: self.data.clone(),
         }
     }
@@ -108,7 +113,8 @@ impl<A, P: SharedPointerKind> Node<A, P> {
     #[inline(always)]
     pub(crate) fn new() -> Self {
         Node {
-            inline_collisions: true,
+            inline_collisions: false,
+            solving_collisions: false,
             data: SparseChunk::new(),
         }
     }
@@ -152,10 +158,15 @@ impl<A, P: SharedPointerKind> Node<A, P> {
     fn pair(
         index1: usize,
         value1: Entry<A, P>,
-        index2: usize,
+        mut index2: usize,
         value2: Entry<A, P>,
     ) -> SharedPointer<Self, P> {
+        let inline_collisions = index1 == index2;
+        if inline_collisions {
+            index2 = (index1 + 1) % HASH_WIDTH;
+        }
         Self::with(|this| {
+            this.inline_collisions = true;
             this.data.insert(index1, value1);
             this.data.insert(index2, value2);
         })
@@ -183,17 +194,10 @@ impl<A: HashValue, P: SharedPointerKind> Node<A, P> {
         shift: usize,
     ) -> SharedPointer<Self, P> {
         let index1 = mask(hash1, shift) as usize;
-        let mut index2 = mask(hash2, shift) as usize;
+        let index2 = mask(hash2, shift) as usize;
         if shift + HASH_SHIFT >= HASH_WIDTH && index1 == index2 {
-            // If we're at the bottom, we've got a collision.
-            Node::unit(
-                index1,
-                Entry::from(CollisionNode::new(hash1, value1, value2)),
-            )
+            todo!()
         } else {
-            if index1 == index2 {
-                index2 = (index1 + 1) % HASH_WIDTH;
-            }
             Node::pair(
                 index1,
                 Entry::Value(value1, hash1),
@@ -234,27 +238,36 @@ impl<A: HashValue, P: SharedPointerKind> Node<A, P> {
         BK: Eq + ?Sized,
         A::Key: Borrow<BK>,
     {
-        let index = mask(hash, shift) as usize;
-        if let Some(entry) = self.data.get_mut(index) {
-            match entry {
-                Entry::Value(ref mut value, _) => {
+        let mut index = mask(hash, shift) as usize;
+        let this = self as *mut Self;
+        #[allow(dropping_references)]
+        drop(self); // prevent self from being used or moved, so this is safe to dereference
+        loop {
+            // Restore a mutable reference to self to avoid hitting the borrow checker
+            // limitation that prevents us from returning mutable references from the original
+            // `self` inside a loop. This is safe because we only restore the mutable reference
+            // once per iteration and the references goes out of scope at the end of the loop.
+            #[allow(unsafe_code)]
+            let this = unsafe { &mut *this };
+            return match this.data.get_mut(index) {
+                Some(Entry::Node(ref mut child_ref)) => {
+                    SharedPointer::make_mut(child_ref).get_mut(hash, shift + HASH_SHIFT, key)
+                }
+                Some(Entry::Value(ref mut value, _)) => {
                     if key == value.extract_key().borrow() {
                         Some(value)
-                    } else {
+                    } else if !this.inline_collisions {
                         None
+                    } else {
+                        index = (index + 1) % HASH_WIDTH;
+                        continue;
                     }
                 }
-                Entry::Collision(ref mut coll_ref) => {
-                    let coll = SharedPointer::make_mut(coll_ref);
-                    coll.get_mut(key)
+                Some(Entry::Collision(ref mut coll_ref)) => {
+                    SharedPointer::make_mut(coll_ref).get_mut(key)
                 }
-                Entry::Node(ref mut child_ref) => {
-                    let child = SharedPointer::make_mut(child_ref);
-                    child.get_mut(hash, shift + HASH_SHIFT, key)
-                }
-            }
-        } else {
-            None
+                None => None,
+            };
         }
     }
 
@@ -266,6 +279,7 @@ impl<A: HashValue, P: SharedPointerKind> Node<A, P> {
         let mut index = mask(hash, shift) as usize;
         let initial_index = index;
         let len = self.data.len();
+        let linear_probing = (self.inline_collisions || len <= HASH_WIDTH / 2) && !self.solving_collisions;
         while let Some(entry) = self.data.get_mut(index) {
             // Value is here
             match entry {
@@ -276,7 +290,7 @@ impl<A: HashValue, P: SharedPointerKind> Node<A, P> {
                     {
                         return Some(mem::replace(current, value));
                     }
-                    if self.inline_collisions {
+                    if self.inline_collisions&& !self.solving_collisions {
                         index = (index + 1) % HASH_WIDTH;
                         continue;
                     }
@@ -310,8 +324,9 @@ impl<A: HashValue, P: SharedPointerKind> Node<A, P> {
         }
 
         // dbg!(index, initial_index, shift, len, self.collisions.is_full());
-        if index != initial_index && len >= HASH_WIDTH / 2 {
+        if self.inline_collisions && len >= HASH_WIDTH / 2 {
             self.inline_collisions = false;
+            self.solving_collisions = true;
             let old_data = mem::take(&mut self.data);
             for (i, entry) in old_data.option_drain().enumerate() {
                 let Some(entry) = entry else {
@@ -326,17 +341,15 @@ impl<A: HashValue, P: SharedPointerKind> Node<A, P> {
                     }
                 }
             }
-            return self.insert(hash, shift, value);
+            self.insert(hash, shift, value);
+            assert!(!self.inline_collisions);
+            self.solving_collisions = false;
+            return None;
         }
 
         self.inline_collisions |= index != initial_index;
-
-        // If we get here, either we found nothing at this index, in which case
-        // we insert a new entry, or we hit a value entry with the same key, in
-        // which case we replace it.
-        self.data
-            .insert(index, Entry::Value(value, hash))
-            .map(Entry::unwrap_value)
+        self.data.insert(index, Entry::Value(value, hash));
+        None
     }
 
     pub(crate) fn remove<BK>(&mut self, hash: HashBits, shift: usize, key: &BK) -> Option<A>
@@ -345,53 +358,98 @@ impl<A: HashValue, P: SharedPointerKind> Node<A, P> {
         BK: Eq + ?Sized,
         A::Key: Borrow<BK>,
     {
-        let index = mask(hash, shift) as usize;
-        let mut new_node = None;
-        let mut removed = None;
-        if let Some(entry) = self.data.get_mut(index) {
-            match entry {
-                Entry::Value(ref value, _) => {
-                    if key != value.extract_key().borrow() {
-                        // Key wasn't in the map.
-                        return None;
-                    } // Otherwise, fall through to the removal.
-                }
-                Entry::Collision(ref mut coll_ref) => {
-                    let coll = SharedPointer::make_mut(coll_ref);
-                    removed = coll.remove(key);
-                    if coll.len() == 1 {
-                        new_node = Some(coll.pop());
-                    } else {
-                        return removed;
-                    }
-                }
-                Entry::Node(ref mut child_ref) => {
-                    let child = SharedPointer::make_mut(child_ref);
-                    match child.remove(hash, shift + HASH_SHIFT, key) {
-                        None => {
+        let mut index = mask(hash, shift) as usize;
+        // First find the entry to remove
+        loop {
+            match self.data.get(index) {
+                None => return None,
+                Some(entry) => match entry {
+                    Entry::Value(value, _) => {
+                        if key == value.extract_key().borrow() {
+                            break;
+                        } else if !self.inline_collisions {
                             return None;
+                        } else {
+                            index = (index + 1) % HASH_WIDTH;
                         }
-                        Some(value) => {
-                            if child.len() == 1
-                                && child.data[child.data.first_index().unwrap()].is_value()
-                            {
-                                // If the child now contains only a single value node,
-                                // pull it up one level and discard the child.
-                                removed = Some(value);
-                                new_node = Some(child.pop());
-                            } else {
-                                return Some(value);
-                            }
+                    }
+                    Entry::Collision(_) | Entry::Node(_) => break,
+                },
+            }
+        }
+
+        let new_node;
+        let removed;
+
+        match self.data.get_mut(index) {
+            Some(Entry::Node(ref mut child_ref)) => {
+                let child = SharedPointer::make_mut(child_ref);
+                match child.remove(hash, shift + HASH_SHIFT, key) {
+                    None => return None,
+                    Some(value) => {
+                        if child.len() == 1
+                            && child.data[child.data.first_index().unwrap()].is_value()
+                        {
+                            removed = Some(value);
+                            new_node = Some(child.pop());
+                        } else {
+                            return Some(value);
                         }
                     }
                 }
             }
+            Some(Entry::Value(..)) => {
+                new_node = None;
+                removed = self.data.remove(index).map(Entry::unwrap_value);
+            }
+            Some(Entry::Collision(ref mut coll_ref)) => {
+                let coll = SharedPointer::make_mut(coll_ref);
+                removed = coll.remove(key);
+                if coll.len() == 1 {
+                    new_node = Some(coll.pop());
+                } else {
+                    return removed;
+                }
+            }
+            None => return None,
         }
+
         if let Some(node) = new_node {
             self.data.insert(index, node);
-            return removed;
+        } else if self.inline_collisions {
+            // Perform backwards shift if using linear probing
+            let mut next = (index + 1) % HASH_WIDTH;
+            loop {
+                match self.data.get(next) {
+                    None => break,
+                    Some(Entry::Value(_, value_hash)) => {
+                        let ideal_index = mask(*value_hash, shift) as usize;
+                        let next_dib = if next >= ideal_index {
+                            next - ideal_index
+                        } else {
+                            HASH_WIDTH - ideal_index + next
+                        };
+                        let index_dib = if index >= ideal_index {
+                            index - ideal_index
+                        } else {
+                            HASH_WIDTH - ideal_index + index
+                        };
+
+                        // dbg!(index, next, ideal_index, next_dib, index_dib);
+
+                        if index_dib < next_dib {
+                            let entry = self.data.remove(next).unwrap();
+                            self.data.insert(index, entry);
+                            index = next;
+                        }
+                        next = (next + 1) % HASH_WIDTH;
+                    }
+                    _ => break,
+                }
+            }
         }
-        self.data.remove(index).map(Entry::unwrap_value)
+
+        removed
     }
 }
 
