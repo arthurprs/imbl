@@ -44,19 +44,16 @@ pub trait HashValue {
 }
 
 pub(crate) struct Node<A, P: SharedPointerKind> {
-    /// Whether this node is using inline collisions.
-    /// When true it uses linear probing to resolve collisions,
-    /// and the child nodes are always `Value`s.
-    inline_collisions: bool,
-    solving_collisions: bool,
+    /// Whether this node is using linear probing for collision resolution.
+    /// When true all child nodes are `Value`s.
+    linear_probing: bool,
     data: SparseChunk<Entry<A, P>, HASH_WIDTH>,
 }
 
 impl<A: Clone, P: SharedPointerKind> Clone for Node<A, P> {
     fn clone(&self) -> Self {
         Self {
-            inline_collisions: self.inline_collisions.clone(),
-            solving_collisions: self.solving_collisions.clone(),
+            linear_probing: self.linear_probing.clone(),
             data: self.data.clone(),
         }
     }
@@ -113,8 +110,7 @@ impl<A, P: SharedPointerKind> Node<A, P> {
     #[inline(always)]
     pub(crate) fn new() -> Self {
         Node {
-            inline_collisions: false,
-            solving_collisions: false,
+            linear_probing: true,
             data: SparseChunk::new(),
         }
     }
@@ -148,36 +144,19 @@ impl<A, P: SharedPointerKind> Node<A, P> {
     }
 
     #[inline]
-    fn unit(index: usize, value: Entry<A, P>) -> SharedPointer<Self, P> {
-        Self::with(|this| {
-            this.data.insert(index, value);
-        })
-    }
-
-    #[inline]
     fn pair(
         index1: usize,
         value1: Entry<A, P>,
         mut index2: usize,
         value2: Entry<A, P>,
     ) -> SharedPointer<Self, P> {
-        let inline_collisions = index1 == index2;
-        if inline_collisions {
+        if index1 == index2 {
             index2 = (index1 + 1) % HASH_WIDTH;
         }
         Self::with(|this| {
-            this.inline_collisions = true;
             this.data.insert(index1, value1);
             this.data.insert(index2, value2);
         })
-    }
-
-    #[inline]
-    pub(crate) fn single_child(
-        index: usize,
-        node: SharedPointer<Self, P>,
-    ) -> SharedPointer<Self, P> {
-        Self::unit(index, Entry::Node(node))
     }
 
     fn pop(&mut self) -> Entry<A, P> {
@@ -186,6 +165,7 @@ impl<A, P: SharedPointerKind> Node<A, P> {
 }
 
 impl<A: HashValue, P: SharedPointerKind> Node<A, P> {
+    #[inline]
     fn merge_values(
         value1: A,
         hash1: HashBits,
@@ -193,18 +173,12 @@ impl<A: HashValue, P: SharedPointerKind> Node<A, P> {
         hash2: HashBits,
         shift: usize,
     ) -> SharedPointer<Self, P> {
-        let index1 = mask(hash1, shift) as usize;
-        let index2 = mask(hash2, shift) as usize;
-        if shift + HASH_SHIFT >= HASH_WIDTH && index1 == index2 {
-            todo!()
-        } else {
-            Node::pair(
-                index1,
-                Entry::Value(value1, hash1),
-                index2,
-                Entry::Value(value2, hash2),
-            )
-        }
+        Node::pair(
+            mask(hash1, shift) as usize,
+            Entry::Value(value1, hash1),
+            mask(hash2, shift) as usize,
+            Entry::Value(value2, hash2),
+        )
     }
 
     pub(crate) fn get<BK>(&self, hash: HashBits, shift: usize, key: &BK) -> Option<&A>
@@ -215,10 +189,10 @@ impl<A: HashValue, P: SharedPointerKind> Node<A, P> {
         let mut index = mask(hash, shift) as usize;
         while let Some(entry) = self.data.get(index) {
             return match entry {
-                Entry::Value(ref value, _) => {
-                    if key == value.extract_key().borrow() {
+                Entry::Value(ref value, value_hash) => {
+                    if hash_may_eq::<A>(hash, *value_hash) && key == value.extract_key().borrow() {
                         Some(value)
-                    } else if !self.inline_collisions {
+                    } else if !self.linear_probing {
                         None
                     } else {
                         index = (index + 1) % HASH_WIDTH;
@@ -238,10 +212,10 @@ impl<A: HashValue, P: SharedPointerKind> Node<A, P> {
         BK: Eq + ?Sized,
         A::Key: Borrow<BK>,
     {
-        let mut index = mask(hash, shift) as usize;
         let this = self as *mut Self;
         #[allow(dropping_references)]
-        drop(self); // prevent self from being used or moved, so this is safe to dereference
+        drop(self); // prevent self from being used or moved, so it's is safe to dereference `this` later
+        let mut index = mask(hash, shift) as usize;
         loop {
             // Restore a mutable reference to self to avoid hitting the borrow checker
             // limitation that prevents us from returning mutable references from the original
@@ -253,10 +227,10 @@ impl<A: HashValue, P: SharedPointerKind> Node<A, P> {
                 Some(Entry::Node(ref mut child_ref)) => {
                     SharedPointer::make_mut(child_ref).get_mut(hash, shift + HASH_SHIFT, key)
                 }
-                Some(Entry::Value(ref mut value, _)) => {
-                    if key == value.extract_key().borrow() {
+                Some(Entry::Value(ref mut value, value_hash)) => {
+                    if hash_may_eq::<A>(hash, *value_hash) && key == value.extract_key().borrow() {
                         Some(value)
-                    } else if !this.inline_collisions {
+                    } else if !this.linear_probing {
                         None
                     } else {
                         index = (index + 1) % HASH_WIDTH;
@@ -277,20 +251,17 @@ impl<A: HashValue, P: SharedPointerKind> Node<A, P> {
         A: Clone,
     {
         let mut index = mask(hash, shift) as usize;
-        let initial_index = index;
-        let len = self.data.len();
-        let linear_probing = (self.inline_collisions || len <= HASH_WIDTH / 2) && !self.solving_collisions;
         while let Some(entry) = self.data.get_mut(index) {
             // Value is here
             match entry {
                 // Update value or create a subtree
                 Entry::Value(ref mut current, current_hash) => {
-                    if (!mem::needs_drop::<A>() || *current_hash == hash)
+                    if hash_may_eq::<A>(hash, *current_hash)
                         && current.extract_key() == value.extract_key()
                     {
                         return Some(mem::replace(current, value));
                     }
-                    if self.inline_collisions&& !self.solving_collisions {
+                    if self.linear_probing {
                         index = (index + 1) % HASH_WIDTH;
                         continue;
                     }
@@ -306,48 +277,37 @@ impl<A: HashValue, P: SharedPointerKind> Node<A, P> {
                     return child.insert(hash, shift + HASH_SHIFT, value);
                 }
             }
-            // If we get here, we're looking at a value entry that needs a merge.
+
+            // If we get here, we're inserting a value over an exiting value (collision).
             // We're going to be unsafe and pry it out of the reference, trusting
             // that we overwrite it with the merged node.
-            let old_entry = unsafe { ptr::read(entry) };
-            if shift + HASH_SHIFT >= HASH_WIDTH {
-                // We're at the lowest level, need to set up a collision node.
-                let coll = CollisionNode::new(hash, old_entry.unwrap_value(), value);
-                unsafe { ptr::write(entry, Entry::from(coll)) };
-            } else if let Entry::Value(old_value, old_hash) = old_entry {
-                let node = Node::merge_values(old_value, old_hash, value, hash, shift + HASH_SHIFT);
-                unsafe { ptr::write(entry, Entry::Node(node)) };
-            } else {
+            let Entry::Value(old_value, old_hash) = (unsafe { ptr::read(entry) }) else {
                 unreachable!()
-            }
+            };
+            let new_entry = if shift + HASH_SHIFT >= HASH_WIDTH {
+                // We're at the lowest level, need to set up a collision node.
+                let coll = CollisionNode::new(hash, old_value, value);
+                Entry::from(coll)
+            } else {
+                let node = Node::merge_values(old_value, old_hash, value, hash, shift + HASH_SHIFT);
+                Entry::Node(node)
+            };
+            unsafe { ptr::write(entry, new_entry) };
             return None;
         }
 
-        // dbg!(index, initial_index, shift, len, self.collisions.is_full());
-        if self.inline_collisions && len >= HASH_WIDTH / 2 {
-            self.inline_collisions = false;
-            self.solving_collisions = true;
+        if self.linear_probing && self.data.len() >= HASH_WIDTH / 2 {
+            self.linear_probing = false;
             let old_data = mem::take(&mut self.data);
-            for (i, entry) in old_data.option_drain().enumerate() {
-                let Some(entry) = entry else {
-                    continue;
-                };
-                match entry {
-                    Entry::Value(value, hash) => {
-                        self.insert(hash, shift, value);
-                    }
-                    entry => {
-                        self.data.insert(i, entry);
-                    }
+            for entry in old_data.drain() {
+                if let Entry::Value(value, hash) = entry {
+                    self.insert(hash, shift, value);
+                } else {
+                    unreachable!("linear probing should only contain values")
                 }
             }
-            self.insert(hash, shift, value);
-            assert!(!self.inline_collisions);
-            self.solving_collisions = false;
-            return None;
+            return self.insert(hash, shift, value);
         }
-
-        self.inline_collisions |= index != initial_index;
         self.data.insert(index, Entry::Value(value, hash));
         None
     }
@@ -363,26 +323,23 @@ impl<A: HashValue, P: SharedPointerKind> Node<A, P> {
         loop {
             match self.data.get(index) {
                 None => return None,
-                Some(entry) => match entry {
-                    Entry::Value(value, _) => {
-                        if key == value.extract_key().borrow() {
-                            break;
-                        } else if !self.inline_collisions {
-                            return None;
-                        } else {
-                            index = (index + 1) % HASH_WIDTH;
-                        }
+                Some(Entry::Value(value, value_hash)) => {
+                    if hash_may_eq::<A>(hash, *value_hash) && key == value.extract_key().borrow() {
+                        break;
+                    } else if !self.linear_probing {
+                        return None;
+                    } else {
+                        index = (index + 1) % HASH_WIDTH;
                     }
-                    Entry::Collision(_) | Entry::Node(_) => break,
-                },
+                }
+                Some(Entry::Collision(_) | Entry::Node(_)) => break,
             }
         }
 
         let new_node;
         let removed;
-
-        match self.data.get_mut(index) {
-            Some(Entry::Node(ref mut child_ref)) => {
+        match self.data.get_mut(index).unwrap() {
+            Entry::Node(ref mut child_ref) => {
                 let child = SharedPointer::make_mut(child_ref);
                 match child.remove(hash, shift + HASH_SHIFT, key) {
                     None => return None,
@@ -398,11 +355,11 @@ impl<A: HashValue, P: SharedPointerKind> Node<A, P> {
                     }
                 }
             }
-            Some(Entry::Value(..)) => {
+            Entry::Value(..) => {
                 new_node = None;
                 removed = self.data.remove(index).map(Entry::unwrap_value);
             }
-            Some(Entry::Collision(ref mut coll_ref)) => {
+            Entry::Collision(ref mut coll_ref) => {
                 let coll = SharedPointer::make_mut(coll_ref);
                 removed = coll.remove(key);
                 if coll.len() == 1 {
@@ -411,46 +368,34 @@ impl<A: HashValue, P: SharedPointerKind> Node<A, P> {
                     return removed;
                 }
             }
-            None => return None,
         }
 
         if let Some(node) = new_node {
             self.data.insert(index, node);
-        } else if self.inline_collisions {
+        } else if self.linear_probing {
             // Perform backwards shift if using linear probing
             let mut next = (index + 1) % HASH_WIDTH;
-            loop {
-                match self.data.get(next) {
-                    None => break,
-                    Some(Entry::Value(_, value_hash)) => {
-                        let ideal_index = mask(*value_hash, shift) as usize;
-                        let next_dib = if next >= ideal_index {
-                            next - ideal_index
-                        } else {
-                            HASH_WIDTH - ideal_index + next
-                        };
-                        let index_dib = if index >= ideal_index {
-                            index - ideal_index
-                        } else {
-                            HASH_WIDTH - ideal_index + index
-                        };
-
-                        // dbg!(index, next, ideal_index, next_dib, index_dib);
-
-                        if index_dib < next_dib {
-                            let entry = self.data.remove(next).unwrap();
-                            self.data.insert(index, entry);
-                            index = next;
-                        }
-                        next = (next + 1) % HASH_WIDTH;
-                    }
-                    _ => break,
+            while let Some(Entry::Value(_, value_hash)) = self.data.get(next) {
+                let ideal_index = mask(*value_hash, shift) as usize;
+                let next_dib = next.wrapping_sub(ideal_index) % HASH_WIDTH;
+                let index_dib = index.wrapping_sub(ideal_index) % HASH_WIDTH;
+                if index_dib < next_dib {
+                    let entry = self.data.remove(next).unwrap();
+                    self.data.insert(index, entry);
+                    index = next;
                 }
+                next = (next + 1) % HASH_WIDTH;
             }
         }
 
         removed
     }
+}
+
+/// Compare two hashes, returning true if they are equal or if the Key is (likely) cheap to compare.
+#[inline]
+fn hash_may_eq<A: HashValue>(hash: u32, other_hash: u32) -> bool {
+    (!mem::needs_drop::<A::Key>() && mem::size_of::<A::Key>() <= 16) || hash == other_hash
 }
 
 impl<A: HashValue> CollisionNode<A> {
@@ -462,7 +407,7 @@ impl<A: HashValue> CollisionNode<A> {
     }
 
     #[inline]
-    fn len(&self) -> usize {
+    pub(crate) fn len(&self) -> usize {
         self.data.len()
     }
 

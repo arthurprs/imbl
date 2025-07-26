@@ -325,7 +325,7 @@ impl<K, V, S, P: SharedPointerKind> GenericHashMap<K, V, S, P> {
 
     /// Print a summary of the HashMap structure showing per-level statistics.
     /// This includes the number of nodes at each level and the distribution of child types.
-    pub fn print_structure_summary(&self) {
+    pub fn print_structure_summary(&self) where  {
         use std::collections::VecDeque;
 
         println!("HashMap Structure Summary:");
