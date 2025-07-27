@@ -16,14 +16,14 @@ use bitmaps::{Bits, BitsImpl};
 use imbl_sized_chunks::inline_array::InlineArray;
 use imbl_sized_chunks::sparse_chunk::{Iter as ChunkIter, IterMut as ChunkIterMut, SparseChunk};
 
-use crate::util::clone_ref;
-
 use crate::config::HASH_LEVEL_SIZE as HASH_SHIFT;
 pub(crate) type HashBits = <BitsImpl<HASH_WIDTH> as Bits>::Store; // a uint of HASH_WIDTH bits
 
 const HASH_WIDTH: usize = 2_usize.pow(HASH_SHIFT as u32);
 const HASH_MASK: HashBits = (HASH_WIDTH - 1) as HashBits;
 const ITER_STACK_CAPACITY: usize = (HASH_WIDTH / HASH_SHIFT) + 1;
+const SMALL_NODE_WIDTH: usize = HASH_WIDTH / 2;
+const SMALL_NODE_MASK: HashBits = (SMALL_NODE_WIDTH - 1) as HashBits;
 
 pub(crate) fn hash_key<K: Hash + ?Sized, S: BuildHasher>(bh: &S, key: &K) -> HashBits {
     let mut hasher = bh.build_hasher();
@@ -59,6 +59,143 @@ impl<A: Clone, P: SharedPointerKind> Clone for Node<A, P> {
     }
 }
 
+pub(crate) struct SmallNode<A, P: SharedPointerKind> {
+    data: SparseChunk<Entry<A, P>, SMALL_NODE_WIDTH>,
+}
+
+impl<A: Clone, P: SharedPointerKind> Clone for SmallNode<A, P> {
+    fn clone(&self) -> Self {
+        Self {
+            data: self.data.clone(),
+        }
+    }
+}
+
+impl<A, P: SharedPointerKind> Default for SmallNode<A, P> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<A, P: SharedPointerKind> SmallNode<A, P> {
+    #[inline(always)]
+    pub(crate) fn new() -> Self {
+        SmallNode {
+            data: SparseChunk::new(),
+        }
+    }
+
+    #[inline]
+    fn with(with: impl FnOnce(&mut Self)) -> SharedPointer<Self, P> {
+        let result: SharedPointer<UnsafeCell<mem::MaybeUninit<Self>>, P> =
+            SharedPointer::new(UnsafeCell::new(mem::MaybeUninit::uninit()));
+        #[allow(unsafe_code)]
+        unsafe {
+            (&mut *result.get()).write(SmallNode::new());
+            let mut_ptr = &mut *UnsafeCell::raw_get(&*result);
+            let mut_ptr = MaybeUninit::as_mut_ptr(mut_ptr);
+            with(&mut *mut_ptr);
+            let result = ManuallyDrop::new(result);
+            mem::transmute_copy(&result)
+        }
+    }
+
+    #[inline]
+    fn len(&self) -> usize {
+        self.data.len()
+    }
+
+    #[inline]
+    fn mask(hash: HashBits, shift: usize) -> HashBits {
+        hash >> shift & SMALL_NODE_MASK
+    }
+
+    fn pop(&mut self) -> Entry<A, P> {
+        self.data.pop().unwrap()
+    }
+}
+
+impl<A: HashValue, P: SharedPointerKind> SmallNode<A, P> {
+    pub(crate) fn get<BK>(&self, hash: HashBits, shift: usize, key: &BK) -> Option<&A>
+    where
+        BK: Eq + ?Sized,
+        A::Key: Borrow<BK>,
+    {
+        let index = Self::mask(hash, shift) as usize;
+        match self.data.get(index) {
+            Some(Entry::Value(ref value, value_hash)) => {
+                if hash_may_eq::<A>(hash, *value_hash) && key == value.extract_key().borrow() {
+                    Some(value)
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
+    }
+
+    pub(crate) fn get_mut<BK>(&mut self, hash: HashBits, shift: usize, key: &BK) -> Option<&mut A>
+    where
+        A: Clone,
+        BK: Eq + ?Sized,
+        A::Key: Borrow<BK>,
+    {
+        let index = Self::mask(hash, shift) as usize;
+        match self.data.get_mut(index) {
+            Some(Entry::Value(ref mut value, value_hash)) => {
+                if hash_may_eq::<A>(hash, *value_hash) && key == value.extract_key().borrow() {
+                    Some(value)
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
+    }
+
+    pub(crate) fn insert(&mut self, hash: HashBits, shift: usize, value: A) -> Result<Option<A>, A>
+    where
+        A: Clone,
+    {
+        let index = Self::mask(hash, shift) as usize;
+        match self.data.get_mut(index) {
+            Some(Entry::Value(ref mut existing, existing_hash)) => {
+                if hash_may_eq::<A>(hash, *existing_hash)
+                    && existing.extract_key() == value.extract_key()
+                {
+                    Ok(Some(mem::replace(existing, value)))
+                } else {
+                    Err(value)
+                }
+            }
+            None => {
+                self.data.insert(index, Entry::Value(value, hash));
+                Ok(None)
+            }
+            _ => unreachable!("SmallNode should only contain Values"),
+        }
+    }
+
+    pub(crate) fn remove<BK>(&mut self, hash: HashBits, shift: usize, key: &BK) -> Option<A>
+    where
+        A: Clone,
+        BK: Eq + ?Sized,
+        A::Key: Borrow<BK>,
+    {
+        let index = Self::mask(hash, shift) as usize;
+        match self.data.get(index) {
+            Some(Entry::Value(value, value_hash)) => {
+                if hash_may_eq::<A>(hash, *value_hash) && key == value.extract_key().borrow() {
+                    self.data.remove(index).map(Entry::unwrap_value)
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct CollisionNode<A> {
     hash: HashBits,
@@ -69,6 +206,7 @@ pub(crate) enum Entry<A, P: SharedPointerKind> {
     Value(A, HashBits),
     Collision(SharedPointer<CollisionNode<A>, P>),
     Node(SharedPointer<Node<A, P>, P>),
+    SmallNode(SharedPointer<SmallNode<A, P>, P>),
 }
 
 impl<A: Clone, P: SharedPointerKind> Clone for Entry<A, P> {
@@ -77,6 +215,7 @@ impl<A: Clone, P: SharedPointerKind> Clone for Entry<A, P> {
             Entry::Value(value, hash) => Entry::Value(value.clone(), *hash),
             Entry::Collision(coll) => Entry::Collision(coll.clone()),
             Entry::Node(node) => Entry::Node(node.clone()),
+            Entry::SmallNode(node) => Entry::SmallNode(node.clone()),
         }
     }
 }
@@ -172,13 +311,27 @@ impl<A: HashValue, P: SharedPointerKind> Node<A, P> {
         value2: A,
         hash2: HashBits,
         shift: usize,
-    ) -> SharedPointer<Self, P> {
-        Node::pair(
-            mask(hash1, shift) as usize,
-            Entry::Value(value1, hash1),
-            mask(hash2, shift) as usize,
-            Entry::Value(value2, hash2),
-        )
+    ) -> Entry<A, P> {
+        let small_index1 = SmallNode::<A, P>::mask(hash1, shift) as usize;
+        let small_index2 = SmallNode::<A, P>::mask(hash2, shift) as usize;
+
+        if small_index1 != small_index2 {
+            // Safe to use SmallNode - no information loss
+            let small_node = SmallNode::with(|node| {
+                node.data.insert(small_index1, Entry::Value(value1, hash1));
+                node.data.insert(small_index2, Entry::Value(value2, hash2));
+            });
+            Entry::SmallNode(small_node)
+        } else {
+            // Would collide in SmallNode, create regular Node
+            let node = Node::pair(
+                mask(hash1, shift) as usize,
+                Entry::Value(value1, hash1),
+                mask(hash2, shift) as usize,
+                Entry::Value(value2, hash2),
+            );
+            Entry::Node(node)
+        }
     }
 
     pub(crate) fn get<BK>(&self, hash: HashBits, shift: usize, key: &BK) -> Option<&A>
@@ -201,6 +354,7 @@ impl<A: HashValue, P: SharedPointerKind> Node<A, P> {
                 }
                 Entry::Collision(ref coll) => coll.get(key),
                 Entry::Node(ref child) => child.get(hash, shift + HASH_SHIFT, key),
+                Entry::SmallNode(ref small) => small.get(hash, shift + HASH_SHIFT, key),
             };
         }
         None
@@ -226,6 +380,9 @@ impl<A: HashValue, P: SharedPointerKind> Node<A, P> {
             return match this.data.get_mut(index) {
                 Some(Entry::Node(ref mut child_ref)) => {
                     SharedPointer::make_mut(child_ref).get_mut(hash, shift + HASH_SHIFT, key)
+                }
+                Some(Entry::SmallNode(ref mut small_ref)) => {
+                    SharedPointer::make_mut(small_ref).get_mut(hash, shift + HASH_SHIFT, key)
                 }
                 Some(Entry::Value(ref mut value, value_hash)) => {
                     if hash_may_eq::<A>(hash, *value_hash) && key == value.extract_key().borrow() {
@@ -276,6 +433,29 @@ impl<A: HashValue, P: SharedPointerKind> Node<A, P> {
                     let child = SharedPointer::make_mut(child_ref);
                     return child.insert(hash, shift + HASH_SHIFT, value);
                 }
+                Entry::SmallNode(ref mut small_ref) => {
+                    // SmallNode - first check if we need to upgrade
+                    let small = SharedPointer::make_mut(small_ref);
+                    match small.insert(hash, shift + HASH_SHIFT, value) {
+                        Ok(result) => return result,
+                        Err(value) => {
+                            // It's a collision, need to upgrade to Node
+                            let mut node = Node::new();
+                            for entry in mem::take(&mut small.data) {
+                                if let Entry::Value(v, h) = entry {
+                                    node.insert(h, shift + HASH_SHIFT, v);
+                                } else {
+                                    unreachable!("SmallNode should only contain Values");
+                                }
+                            }
+
+                            // Insert the new value
+                            node.insert(hash, shift + HASH_SHIFT, value);
+                            *entry = Entry::Node(SharedPointer::new(node));
+                            return None;
+                        }
+                    }
+                }
             }
 
             // If we get here, we're inserting a value over an exiting value (collision).
@@ -289,8 +469,7 @@ impl<A: HashValue, P: SharedPointerKind> Node<A, P> {
                 let coll = CollisionNode::new(hash, old_value, value);
                 Entry::from(coll)
             } else {
-                let node = Node::merge_values(old_value, old_hash, value, hash, shift + HASH_SHIFT);
-                Entry::Node(node)
+                Node::merge_values(old_value, old_hash, value, hash, shift + HASH_SHIFT)
             };
             unsafe { ptr::write(entry, new_entry) };
             return None;
@@ -332,7 +511,7 @@ impl<A: HashValue, P: SharedPointerKind> Node<A, P> {
                         index = (index + 1) % HASH_WIDTH;
                     }
                 }
-                Some(Entry::Collision(_) | Entry::Node(_)) => break,
+                Some(Entry::Collision(_) | Entry::Node(_) | Entry::SmallNode(_)) => break,
             }
         }
 
@@ -366,6 +545,20 @@ impl<A: HashValue, P: SharedPointerKind> Node<A, P> {
                     new_node = Some(coll.pop());
                 } else {
                     return removed;
+                }
+            }
+            Entry::SmallNode(ref mut small_ref) => {
+                let small = SharedPointer::make_mut(small_ref);
+                match small.remove(hash, shift + HASH_SHIFT, key) {
+                    None => return None,
+                    Some(value) => {
+                        if small.len() == 1 {
+                            removed = Some(value);
+                            new_node = Some(small.pop());
+                        } else {
+                            return Some(value);
+                        }
+                    }
                 }
             }
         }
@@ -479,11 +672,27 @@ impl<A, P: SharedPointerKind> Node<A, P> {
 /// An allocation-free stack for iterators.
 type InlineStack<T> = InlineArray<T, (usize, [T; ITER_STACK_CAPACITY])>;
 
+enum IterItem<'a, A, P: SharedPointerKind> {
+    Node(ChunkIter<'a, Entry<A, P>, HASH_WIDTH>),
+    SmallNode(ChunkIter<'a, Entry<A, P>, SMALL_NODE_WIDTH>),
+}
+
+// We manually impl Clone for IterItem to allow cloning even when A isn't Clone
+// This works because the iterators hold references, not owned values
+impl<'a, A, P: SharedPointerKind> Clone for IterItem<'a, A, P> {
+    fn clone(&self) -> Self {
+        match self {
+            IterItem::Node(iter) => IterItem::Node(iter.clone()),
+            IterItem::SmallNode(iter) => IterItem::SmallNode(iter.clone()),
+        }
+    }
+}
+
 // Ref iterator
 
 pub(crate) struct Iter<'a, A, P: SharedPointerKind> {
     count: usize,
-    stack: InlineStack<ChunkIter<'a, Entry<A, P>, HASH_WIDTH>>,
+    stack: InlineStack<IterItem<'a, A, P>>,
     collision: Option<(HashBits, SliceIter<'a, A>)>,
 }
 
@@ -510,7 +719,7 @@ where
             collision: None,
         };
         if let Some(node) = root {
-            result.stack.push(node.data.iter());
+            result.stack.push(IterItem::Node(node.data.iter()));
         }
         result
     }
@@ -536,13 +745,21 @@ where
             }
 
             while let Some(current) = self.stack.last_mut() {
-                match current.next() {
+                let next_entry = match current {
+                    IterItem::Node(iter) => iter.next(),
+                    IterItem::SmallNode(iter) => iter.next(),
+                };
+
+                match next_entry {
                     Some(Entry::Value(value, hash)) => {
                         self.count -= 1;
                         return Some((value, *hash));
                     }
                     Some(Entry::Node(child)) => {
-                        self.stack.push(child.data.iter());
+                        self.stack.push(IterItem::Node(child.data.iter()));
+                    }
+                    Some(Entry::SmallNode(small)) => {
+                        self.stack.push(IterItem::SmallNode(small.data.iter()));
                     }
                     Some(Entry::Collision(coll)) => {
                         self.collision = Some((coll.hash, coll.data.iter()));
@@ -568,9 +785,14 @@ impl<'a, A, P: SharedPointerKind> FusedIterator for Iter<'a, A, P> where A: 'a {
 
 // Mut ref iterator
 
+enum IterMutItem<'a, A, P: SharedPointerKind> {
+    Node(ChunkIterMut<'a, Entry<A, P>, HASH_WIDTH>),
+    SmallNode(ChunkIterMut<'a, Entry<A, P>, SMALL_NODE_WIDTH>),
+}
+
 pub(crate) struct IterMut<'a, A, P: SharedPointerKind> {
     count: usize,
-    stack: InlineStack<ChunkIterMut<'a, Entry<A, P>, HASH_WIDTH>>,
+    stack: InlineStack<IterMutItem<'a, A, P>>,
     collision: Option<(HashBits, SliceIterMut<'a, A>)>,
 }
 
@@ -586,7 +808,7 @@ where
             collision: None,
         };
         if let Some(node) = root {
-            result.stack.push(node.data.iter_mut());
+            result.stack.push(IterMutItem::Node(node.data.iter_mut()));
         }
         result
     }
@@ -612,14 +834,24 @@ where
             }
 
             while let Some(current) = self.stack.last_mut() {
-                match current.next() {
+                let next_entry = match current {
+                    IterMutItem::Node(iter) => iter.next(),
+                    IterMutItem::SmallNode(iter) => iter.next(),
+                };
+
+                match next_entry {
                     Some(Entry::Value(value, hash)) => {
                         self.count -= 1;
                         return Some((value, *hash));
                     }
                     Some(Entry::Node(child_ref)) => {
                         let child = SharedPointer::make_mut(child_ref);
-                        self.stack.push(child.data.iter_mut());
+                        self.stack.push(IterMutItem::Node(child.data.iter_mut()));
+                    }
+                    Some(Entry::SmallNode(small_ref)) => {
+                        let small = SharedPointer::make_mut(small_ref);
+                        self.stack
+                            .push(IterMutItem::SmallNode(small.data.iter_mut()));
                     }
                     Some(Entry::Collision(coll_ref)) => {
                         let coll = SharedPointer::make_mut(coll_ref);
@@ -646,10 +878,15 @@ impl<'a, A, P: SharedPointerKind> FusedIterator for IterMut<'a, A, P> where A: C
 
 // Consuming iterator
 
+enum DrainItem<A, P: SharedPointerKind> {
+    Node(SharedPointer<Node<A, P>, P>),
+    SmallNode(SharedPointer<SmallNode<A, P>, P>),
+    Collision(SharedPointer<CollisionNode<A>, P>),
+}
+
 pub(crate) struct Drain<A, P: SharedPointerKind> {
     count: usize,
-    stack: InlineStack<SharedPointer<Node<A, P>, P>>,
-    collision: Option<CollisionNode<A>>,
+    stack: InlineStack<DrainItem<A, P>>,
 }
 
 impl<A, P: SharedPointerKind> Drain<A, P> {
@@ -657,10 +894,9 @@ impl<A, P: SharedPointerKind> Drain<A, P> {
         let mut result = Drain {
             count: size,
             stack: InlineStack::new(),
-            collision: None,
         };
         if let Some(root) = root {
-            result.stack.push(root);
+            result.stack.push(DrainItem::Node(root));
         }
         result
     }
@@ -673,37 +909,45 @@ where
     type Item = (A, HashBits);
 
     fn next(&mut self) -> Option<Self::Item> {
-        'outer: loop {
-            if let Some(coll) = &mut self.collision {
-                match coll.data.pop() {
-                    None => self.collision = None,
-                    Some(value) => {
-                        self.count -= 1;
-                        return Some((value, coll.hash));
-                    }
-                };
-            }
-
-            while let Some(current) = self.stack.last_mut() {
-                match SharedPointer::make_mut(current).data.pop() {
+        while let Some(current) = self.stack.last_mut() {
+            match current {
+                DrainItem::Node(node_ref) => match SharedPointer::make_mut(node_ref).data.pop() {
                     Some(Entry::Value(value, hash)) => {
                         self.count -= 1;
                         return Some((value, hash));
                     }
                     Some(Entry::Node(child)) => {
-                        self.stack.push(child);
+                        self.stack.push(DrainItem::Node(child));
+                    }
+                    Some(Entry::SmallNode(small)) => {
+                        self.stack.push(DrainItem::SmallNode(small));
                     }
                     Some(Entry::Collision(coll)) => {
-                        self.collision = Some(clone_ref(coll));
-                        continue 'outer;
+                        self.stack.push(DrainItem::Collision(coll));
                     }
                     None => {
                         self.stack.pop();
                     }
+                },
+                DrainItem::SmallNode(small_ref) => {
+                    let small = SharedPointer::make_mut(small_ref);
+                    if let Some(Entry::Value(value, hash)) = small.data.pop() {
+                        self.count -= 1;
+                        return Some((value, hash));
+                    }
+                    self.stack.pop();
+                }
+                DrainItem::Collision(coll_ref) => {
+                    let coll = SharedPointer::make_mut(coll_ref);
+                    if let Some(value) = coll.data.pop() {
+                        self.count -= 1;
+                        return Some((value, coll.hash));
+                    }
+                    self.stack.pop();
                 }
             }
-            return None;
         }
+        None
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
@@ -724,6 +968,21 @@ impl<A: fmt::Debug, P: SharedPointerKind> fmt::Debug for Node<A, P> {
                 Entry::Value(v, h) => write!(f, "{:?} :: {}, ", v, h)?,
                 Entry::Collision(c) => write!(f, "Coll{:?} :: {}", c.data, c.hash)?,
                 Entry::Node(n) => write!(f, "{:?}, ", n)?,
+                Entry::SmallNode(s) => write!(f, "{:?}, ", s)?,
+            }
+        }
+        write!(f, " ]")
+    }
+}
+
+impl<A: fmt::Debug, P: SharedPointerKind> fmt::Debug for SmallNode<A, P> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> Result<(), fmt::Error> {
+        write!(f, "SmallNode[ ")?;
+        for i in self.data.indices() {
+            write!(f, "{}: ", i)?;
+            match &self.data[i] {
+                Entry::Value(v, h) => write!(f, "{:?} :: {}, ", v, h)?,
+                _ => unreachable!("SmallNode should only contain Values"),
             }
         }
         write!(f, " ]")
