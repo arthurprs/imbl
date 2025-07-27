@@ -2648,7 +2648,7 @@ mod test {
 #[test]
 fn main() {
     // Test with different sizes of HashMaps
-    let sizes = vec![10000];
+    let sizes = vec![100000];
 
     for size in sizes {
         println!("\n=== Testing with {} entries ===", size);

@@ -23,7 +23,6 @@ const HASH_WIDTH: usize = 2_usize.pow(HASH_SHIFT as u32);
 const HASH_MASK: HashBits = (HASH_WIDTH - 1) as HashBits;
 const ITER_STACK_CAPACITY: usize = (HASH_WIDTH / HASH_SHIFT) + 1;
 const SMALL_NODE_WIDTH: usize = HASH_WIDTH / 2;
-const SMALL_NODE_MASK: HashBits = (SMALL_NODE_WIDTH - 1) as HashBits;
 
 pub(crate) fn hash_key<K: Hash + ?Sized, S: BuildHasher>(bh: &S, key: &K) -> HashBits {
     let mut hasher = bh.build_hasher();
@@ -43,44 +42,48 @@ pub trait HashValue {
     fn ptr_eq(&self, other: &Self) -> bool;
 }
 
-pub(crate) struct Node<A, P: SharedPointerKind> {
+pub(crate) struct GenericNode<A, P: SharedPointerKind, const WIDTH: usize>
+where
+    BitsImpl<WIDTH>: Bits,
+{
     /// Whether this node is using linear probing for collision resolution.
     /// When true all child nodes are `Value`s.
     linear_probing: bool,
-    data: SparseChunk<Entry<A, P>, HASH_WIDTH>,
+    data: SparseChunk<Entry<A, P>, WIDTH>,
 }
 
-impl<A: Clone, P: SharedPointerKind> Clone for Node<A, P> {
+impl<A: Clone, P: SharedPointerKind, const WIDTH: usize> Clone for GenericNode<A, P, WIDTH>
+where
+    BitsImpl<WIDTH>: Bits,
+{
     fn clone(&self) -> Self {
         Self {
-            linear_probing: self.linear_probing.clone(),
+            linear_probing: self.linear_probing,
             data: self.data.clone(),
         }
     }
 }
 
-pub(crate) struct SmallNode<A, P: SharedPointerKind> {
-    data: SparseChunk<Entry<A, P>, SMALL_NODE_WIDTH>,
-}
+pub(crate) type Node<A, P> = GenericNode<A, P, HASH_WIDTH>;
+pub(crate) type SmallNode<A, P> = GenericNode<A, P, SMALL_NODE_WIDTH>;
 
-impl<A: Clone, P: SharedPointerKind> Clone for SmallNode<A, P> {
-    fn clone(&self) -> Self {
-        Self {
-            data: self.data.clone(),
-        }
-    }
-}
-
-impl<A, P: SharedPointerKind> Default for SmallNode<A, P> {
+impl<A, P: SharedPointerKind, const WIDTH: usize> Default for GenericNode<A, P, WIDTH>
+where
+    BitsImpl<WIDTH>: Bits,
+{
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl<A, P: SharedPointerKind> SmallNode<A, P> {
+impl<A, P: SharedPointerKind, const WIDTH: usize> GenericNode<A, P, WIDTH>
+where
+    BitsImpl<WIDTH>: Bits,
+{
     #[inline(always)]
     pub(crate) fn new() -> Self {
-        SmallNode {
+        GenericNode {
+            linear_probing: true,
             data: SparseChunk::new(),
         }
     }
@@ -91,7 +94,7 @@ impl<A, P: SharedPointerKind> SmallNode<A, P> {
             SharedPointer::new(UnsafeCell::new(mem::MaybeUninit::uninit()));
         #[allow(unsafe_code)]
         unsafe {
-            (&mut *result.get()).write(SmallNode::new());
+            (&mut *result.get()).write(Self::new());
             let mut_ptr = &mut *UnsafeCell::raw_get(&*result);
             let mut_ptr = MaybeUninit::as_mut_ptr(mut_ptr);
             with(&mut *mut_ptr);
@@ -107,7 +110,8 @@ impl<A, P: SharedPointerKind> SmallNode<A, P> {
 
     #[inline]
     fn mask(hash: HashBits, shift: usize) -> HashBits {
-        hash >> shift & SMALL_NODE_MASK
+        let mask = (WIDTH - 1) as HashBits;
+        hash >> shift & mask
     }
 
     fn pop(&mut self) -> Entry<A, P> {
@@ -115,23 +119,46 @@ impl<A, P: SharedPointerKind> SmallNode<A, P> {
     }
 }
 
-impl<A: HashValue, P: SharedPointerKind> SmallNode<A, P> {
+impl<A: HashValue, P: SharedPointerKind, const WIDTH: usize> GenericNode<A, P, WIDTH>
+where
+    BitsImpl<WIDTH>: Bits,
+{
     pub(crate) fn get<BK>(&self, hash: HashBits, shift: usize, key: &BK) -> Option<&A>
     where
         BK: Eq + ?Sized,
         A::Key: Borrow<BK>,
     {
-        let index = Self::mask(hash, shift) as usize;
-        match self.data.get(index) {
-            Some(Entry::Value(ref value, value_hash)) => {
-                if hash_may_eq::<A>(hash, *value_hash) && key == value.extract_key().borrow() {
-                    Some(value)
-                } else {
-                    None
+        let mut index = Self::mask(hash, shift) as usize;
+        while let Some(entry) = self.data.get(index) {
+            return match entry {
+                Entry::Value(ref value, value_hash) => {
+                    if hash_may_eq::<A>(hash, *value_hash) && key == value.extract_key().borrow() {
+                        Some(value)
+                    } else if !self.linear_probing {
+                        None
+                    } else {
+                        index = (index + 1) % WIDTH;
+                        continue;
+                    }
                 }
-            }
-            _ => None,
+                Entry::Collision(ref coll) => coll.get(key),
+                Entry::Node(ref child) => {
+                    if WIDTH < HASH_WIDTH {
+                        unreachable!("SmallNode should not contain Node entries")
+                    } else {
+                        child.get(hash, shift + HASH_SHIFT, key)
+                    }
+                }
+                Entry::SmallNode(ref small) => {
+                    if WIDTH < HASH_WIDTH {
+                        unreachable!("SmallNode should not contain SmallNode entries")
+                    } else {
+                        small.get(hash, shift + HASH_SHIFT, key)
+                    }
+                }
+            };
         }
+        None
     }
 
     pub(crate) fn get_mut<BK>(&mut self, hash: HashBits, shift: usize, key: &BK) -> Option<&mut A>
@@ -140,40 +167,108 @@ impl<A: HashValue, P: SharedPointerKind> SmallNode<A, P> {
         BK: Eq + ?Sized,
         A::Key: Borrow<BK>,
     {
-        let index = Self::mask(hash, shift) as usize;
-        match self.data.get_mut(index) {
-            Some(Entry::Value(ref mut value, value_hash)) => {
-                if hash_may_eq::<A>(hash, *value_hash) && key == value.extract_key().borrow() {
-                    Some(value)
-                } else {
-                    None
+        let this = self as *mut Self;
+        #[allow(dropping_references)]
+        drop(self); // prevent self from being used or moved, so it's is safe to dereference `this` later
+        let mut index = Self::mask(hash, shift) as usize;
+        loop {
+            // Restore a mutable reference to self to avoid hitting the borrow checker
+            // limitation that prevents us from returning mutable references from the original
+            // `self` inside a loop. This is safe because we only restore the mutable reference
+            // once per iteration and the references goes out of scope at the end of the loop.
+            #[allow(unsafe_code)]
+            let this = unsafe { &mut *this };
+            return match this.data.get_mut(index) {
+                Some(Entry::Node(ref mut child_ref)) => {
+                    if WIDTH < HASH_WIDTH {
+                        unreachable!("SmallNode should not contain Node entries")
+                    } else {
+                        SharedPointer::make_mut(child_ref).get_mut(hash, shift + HASH_SHIFT, key)
+                    }
                 }
-            }
-            _ => None,
+                Some(Entry::SmallNode(ref mut small_ref)) => {
+                    if WIDTH < HASH_WIDTH {
+                        unreachable!("SmallNode should not contain SmallNode entries")
+                    } else {
+                        SharedPointer::make_mut(small_ref).get_mut(hash, shift + HASH_SHIFT, key)
+                    }
+                }
+                Some(Entry::Value(ref mut value, value_hash)) => {
+                    if hash_may_eq::<A>(hash, *value_hash) && key == value.extract_key().borrow() {
+                        Some(value)
+                    } else if !this.linear_probing {
+                        None
+                    } else {
+                        index = (index + 1) % WIDTH;
+                        continue;
+                    }
+                }
+                Some(Entry::Collision(ref mut coll_ref)) => {
+                    SharedPointer::make_mut(coll_ref).get_mut(key)
+                }
+                None => None,
+            };
         }
     }
 
+    fn adjust_post_removal(&mut self, shift: usize, mut index: usize) {
+        if self.linear_probing {
+            // Perform backwards shift if using linear probing
+            let mut next = (index + 1) % WIDTH;
+            while let Some(Entry::Value(_, value_hash)) = self.data.get(next) {
+                let ideal_index = mask(*value_hash, shift) as usize;
+                let next_dib = next.wrapping_sub(ideal_index) % WIDTH;
+                let index_dib = index.wrapping_sub(ideal_index) % WIDTH;
+                if index_dib < next_dib {
+                    let entry = self.data.remove(next).unwrap();
+                    self.data.insert(index, entry);
+                    index = next;
+                }
+                next = (next + 1) % WIDTH;
+            }
+        } else {
+            // If we ended up with a single value, restore linear probing
+            if self.data.len() == 1 && self.data.iter().next().is_some_and(|e| e.is_value()) {
+                self.linear_probing = true;
+            }
+        }
+    }
+}
+
+// Separate implementation block for SmallNode-specific method
+impl<A: HashValue, P: SharedPointerKind> SmallNode<A, P> {
     pub(crate) fn insert(&mut self, hash: HashBits, shift: usize, value: A) -> Result<Option<A>, A>
     where
         A: Clone,
     {
-        let index = Self::mask(hash, shift) as usize;
-        match self.data.get_mut(index) {
-            Some(Entry::Value(ref mut existing, existing_hash)) => {
-                if hash_may_eq::<A>(hash, *existing_hash)
-                    && existing.extract_key() == value.extract_key()
-                {
-                    Ok(Some(mem::replace(existing, value)))
-                } else {
-                    Err(value)
+        let mut index = Self::mask(hash, shift) as usize;
+        while let Some(entry) = self.data.get_mut(index) {
+            match entry {
+                Entry::Value(ref mut existing, existing_hash) => {
+                    if hash_may_eq::<A>(hash, *existing_hash)
+                        && existing.extract_key() == value.extract_key()
+                    {
+                        return Ok(Some(mem::replace(existing, value)));
+                    }
+                    if self.linear_probing {
+                        index = (index + 1) % SMALL_NODE_WIDTH;
+                        continue;
+                    } else {
+                        return Err(value);
+                    }
                 }
+                _ => unreachable!("SmallNode should only contain Values"),
             }
-            None => {
-                self.data.insert(index, Entry::Value(value, hash));
-                Ok(None)
-            }
-            _ => unreachable!("SmallNode should only contain Values"),
         }
+
+        // Check if we need to disable linear probing
+        if self.linear_probing && self.data.len() >= SMALL_NODE_WIDTH / 2 {
+            // Need to upgrade to Node
+            return Err(value);
+        }
+
+        self.data.insert(index, Entry::Value(value, hash));
+        Ok(None)
     }
 
     pub(crate) fn remove<BK>(&mut self, hash: HashBits, shift: usize, key: &BK) -> Option<A>
@@ -182,17 +277,232 @@ impl<A: HashValue, P: SharedPointerKind> SmallNode<A, P> {
         BK: Eq + ?Sized,
         A::Key: Borrow<BK>,
     {
-        let index = Self::mask(hash, shift) as usize;
-        match self.data.get(index) {
-            Some(Entry::Value(value, value_hash)) => {
-                if hash_may_eq::<A>(hash, *value_hash) && key == value.extract_key().borrow() {
-                    self.data.remove(index).map(Entry::unwrap_value)
-                } else {
-                    None
+        let mut index = Self::mask(hash, shift) as usize;
+        loop {
+            match self.data.get(index) {
+                None => return None,
+                Some(Entry::Value(value, value_hash)) => {
+                    if hash_may_eq::<A>(hash, *value_hash) && key == value.extract_key().borrow() {
+                        break;
+                    } else if !self.linear_probing {
+                        return None;
+                    } else {
+                        index = (index + 1) % SMALL_NODE_WIDTH;
+                    }
+                }
+                _ => unreachable!("SmallNode should only contain Values"),
+            }
+        }
+
+        let removed = self.data.remove(index).map(Entry::unwrap_value);
+        self.adjust_post_removal(shift, index);
+        removed
+    }
+}
+
+// Implementation block for Node-specific methods
+impl<A: HashValue, P: SharedPointerKind> Node<A, P> {
+    pub(crate) fn insert(&mut self, hash: HashBits, shift: usize, value: A) -> Option<A>
+    where
+        A: Clone,
+    {
+        self.insert_full_node(hash, shift, value)
+    }
+
+    pub(crate) fn remove<BK>(&mut self, hash: HashBits, shift: usize, key: &BK) -> Option<A>
+    where
+        A: Clone,
+        BK: Eq + ?Sized,
+        A::Key: Borrow<BK>,
+    {
+        self.remove_full_node(hash, shift, key)
+    }
+
+    #[inline]
+    fn merge_values(
+        value1: A,
+        hash1: HashBits,
+        value2: A,
+        hash2: HashBits,
+        shift: usize,
+    ) -> Entry<A, P> {
+        let small_index1 = SmallNode::<A, P>::mask(hash1, shift) as usize;
+        let mut small_index2 = SmallNode::<A, P>::mask(hash2, shift) as usize;
+        if small_index1 == small_index2 {
+            small_index2 = (small_index1 + 1) % SMALL_NODE_WIDTH;
+        }
+        let small_node = SmallNode::with(|node| {
+            node.data.insert(small_index1, Entry::Value(value1, hash1));
+            node.data.insert(small_index2, Entry::Value(value2, hash2));
+        });
+        Entry::SmallNode(small_node)
+    }
+
+    #[allow(unsafe_code)]
+    fn insert_full_node(&mut self, hash: HashBits, shift: usize, value: A) -> Option<A>
+    where
+        A: Clone,
+    {
+        let mut index = mask(hash, shift) as usize;
+        while let Some(entry) = self.data.get_mut(index) {
+            // Value is here
+            match entry {
+                // Update value or create a subtree
+                Entry::Value(ref mut current, current_hash) => {
+                    if hash_may_eq::<A>(hash, *current_hash)
+                        && current.extract_key() == value.extract_key()
+                    {
+                        return Some(mem::replace(current, value));
+                    }
+                    if self.linear_probing {
+                        index = (index + 1) % HASH_WIDTH;
+                        continue;
+                    }
+                }
+                Entry::Node(ref mut child_ref) => {
+                    let child = SharedPointer::make_mut(child_ref);
+                    return child.insert(hash, shift + HASH_SHIFT, value);
+                }
+                Entry::SmallNode(ref mut small_ref) => {
+                    let small = SharedPointer::make_mut(small_ref);
+                    match small.insert(hash, shift + HASH_SHIFT, value) {
+                        Ok(result) => return result,
+                        Err(value) => {
+                            // It's a collision, need to upgrade to Node
+                            let mut node = Node::new();
+                            for entry in mem::take(&mut small.data) {
+                                if let Entry::Value(v, h) = entry {
+                                    node.insert(h, shift + HASH_SHIFT, v);
+                                } else {
+                                    unreachable!("SmallNode should only contain Values");
+                                }
+                            }
+
+                            // Insert the new value
+                            node.insert(hash, shift + HASH_SHIFT, value);
+                            *entry = Entry::Node(SharedPointer::new(node));
+                            return None;
+                        }
+                    }
+                }
+                // There's already a collision here.
+                Entry::Collision(ref mut collision) => {
+                    let coll = SharedPointer::make_mut(collision);
+                    return coll.insert(value);
                 }
             }
-            _ => None,
+
+            // If we get here, we're inserting a value over an exiting value (collision).
+            // We're going to be unsafe and pry it out of the reference, trusting
+            // that we overwrite it with the merged node.
+            let Entry::Value(old_value, old_hash) = (unsafe { ptr::read(entry) }) else {
+                unreachable!()
+            };
+            let new_entry = if shift + HASH_SHIFT >= HASH_WIDTH {
+                // We're at the lowest level, need to set up a collision node.
+                let coll = CollisionNode::new(hash, old_value, value);
+                Entry::from(coll)
+            } else {
+                Node::merge_values(old_value, old_hash, value, hash, shift + HASH_SHIFT)
+            };
+            unsafe { ptr::write(entry, new_entry) };
+            return None;
         }
+
+        if self.linear_probing && self.data.len() >= HASH_WIDTH / 2 {
+            self.linear_probing = false;
+            for entry in mem::take(&mut self.data) {
+                if let Entry::Value(value, hash) = entry {
+                    self.insert(hash, shift, value);
+                } else {
+                    unreachable!("linear probing should only contain values")
+                }
+            }
+            return self.insert(hash, shift, value);
+        }
+        self.data.insert(index, Entry::Value(value, hash));
+        None
+    }
+
+    fn remove_full_node<BK>(&mut self, hash: HashBits, shift: usize, key: &BK) -> Option<A>
+    where
+        A: Clone,
+        BK: Eq + ?Sized,
+        A::Key: Borrow<BK>,
+    {
+        let mut index = mask(hash, shift) as usize;
+        // First find the entry to remove
+        loop {
+            match self.data.get(index) {
+                None => return None,
+                Some(Entry::Value(value, value_hash)) => {
+                    if hash_may_eq::<A>(hash, *value_hash) && key == value.extract_key().borrow() {
+                        break;
+                    } else if !self.linear_probing {
+                        return None;
+                    } else {
+                        index = (index + 1) % HASH_WIDTH;
+                    }
+                }
+                Some(Entry::Collision(_) | Entry::Node(_) | Entry::SmallNode(_)) => break,
+            }
+        }
+
+        let new_node;
+        let removed;
+        match self.data.get_mut(index).unwrap() {
+            Entry::Node(ref mut child_ref) => {
+                let child = SharedPointer::make_mut(child_ref);
+                match child.remove(hash, shift + HASH_SHIFT, key) {
+                    None => return None,
+                    Some(value) => {
+                        if child.len() == 1
+                            && child.data.iter().next().is_some_and(|e| e.is_value())
+                        {
+                            removed = Some(value);
+                            new_node = Some(child.pop());
+                        } else {
+                            return Some(value);
+                        }
+                    }
+                }
+            }
+            Entry::SmallNode(ref mut small_ref) => {
+                let small = SharedPointer::make_mut(small_ref);
+                match small.remove(hash, shift + HASH_SHIFT, key) {
+                    None => return None,
+                    Some(value) => {
+                        if small.len() == 1 {
+                            removed = Some(value);
+                            new_node = Some(small.pop());
+                        } else {
+                            return Some(value);
+                        }
+                    }
+                }
+            }
+            Entry::Value(..) => {
+                new_node = None;
+                removed = self.data.remove(index).map(Entry::unwrap_value);
+            }
+            Entry::Collision(ref mut coll_ref) => {
+                let coll = SharedPointer::make_mut(coll_ref);
+                removed = coll.remove(key);
+                if coll.len() == 1 {
+                    new_node = Some(coll.pop());
+                } else {
+                    return removed;
+                }
+            }
+        }
+
+        if let Some(node) = new_node {
+            self.data.insert(index, node);
+        } else {
+            self.adjust_post_removal(shift, index);
+        }
+
+        removed
     }
 }
 
@@ -236,352 +546,6 @@ impl<A, P: SharedPointerKind> Entry<A, P> {
 impl<A, P: SharedPointerKind> From<CollisionNode<A>> for Entry<A, P> {
     fn from(node: CollisionNode<A>) -> Self {
         Entry::Collision(SharedPointer::new(node))
-    }
-}
-
-impl<A, P: SharedPointerKind> Default for Node<A, P> {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl<A, P: SharedPointerKind> Node<A, P> {
-    #[inline(always)]
-    pub(crate) fn new() -> Self {
-        Node {
-            linear_probing: true,
-            data: SparseChunk::new(),
-        }
-    }
-
-    /// Special constructor to allow initializing Nodes w/o incurring multiple memory copies.
-    /// These copies really slow things down once Node crosses a certain size threshold and copies become calls to memcopy.
-    #[inline]
-    fn with(with: impl FnOnce(&mut Self)) -> SharedPointer<Self, P> {
-        let result: SharedPointer<UnsafeCell<mem::MaybeUninit<Self>>, P> =
-            SharedPointer::new(UnsafeCell::new(mem::MaybeUninit::uninit()));
-        #[allow(unsafe_code)]
-        unsafe {
-            // Initialize the MaybeUninit node
-            (&mut *result.get()).write(Node::new());
-            // Dereference all the way to the newly initialized &mut Node
-            let mut_ptr = &mut *UnsafeCell::raw_get(&*result);
-            let mut_ptr = MaybeUninit::as_mut_ptr(mut_ptr);
-            with(&mut *mut_ptr);
-            // Note that transmute isn't usable with the generic argument P, so we have to use
-            // a combination of transmute_copy and ManuallyDrop
-            // Safety: UnsafeCell<_> and UnsafeCell<MaybeUninit<_>> have the same memory representation
-            //         and ManuallyDrop<T> and T have the same memory representation
-            let result = ManuallyDrop::new(result);
-            mem::transmute_copy(&result)
-        }
-    }
-
-    #[inline]
-    fn len(&self) -> usize {
-        self.data.len()
-    }
-
-    #[inline]
-    fn pair(
-        index1: usize,
-        value1: Entry<A, P>,
-        mut index2: usize,
-        value2: Entry<A, P>,
-    ) -> SharedPointer<Self, P> {
-        if index1 == index2 {
-            index2 = (index1 + 1) % HASH_WIDTH;
-        }
-        Self::with(|this| {
-            this.data.insert(index1, value1);
-            this.data.insert(index2, value2);
-        })
-    }
-
-    fn pop(&mut self) -> Entry<A, P> {
-        self.data.pop().unwrap()
-    }
-}
-
-impl<A: HashValue, P: SharedPointerKind> Node<A, P> {
-    #[inline]
-    fn merge_values(
-        value1: A,
-        hash1: HashBits,
-        value2: A,
-        hash2: HashBits,
-        shift: usize,
-    ) -> Entry<A, P> {
-        let small_index1 = SmallNode::<A, P>::mask(hash1, shift) as usize;
-        let small_index2 = SmallNode::<A, P>::mask(hash2, shift) as usize;
-
-        if small_index1 != small_index2 {
-            // Safe to use SmallNode - no information loss
-            let small_node = SmallNode::with(|node| {
-                node.data.insert(small_index1, Entry::Value(value1, hash1));
-                node.data.insert(small_index2, Entry::Value(value2, hash2));
-            });
-            Entry::SmallNode(small_node)
-        } else {
-            // Would collide in SmallNode, create regular Node
-            let node = Node::pair(
-                mask(hash1, shift) as usize,
-                Entry::Value(value1, hash1),
-                mask(hash2, shift) as usize,
-                Entry::Value(value2, hash2),
-            );
-            Entry::Node(node)
-        }
-    }
-
-    pub(crate) fn get<BK>(&self, hash: HashBits, shift: usize, key: &BK) -> Option<&A>
-    where
-        BK: Eq + ?Sized,
-        A::Key: Borrow<BK>,
-    {
-        let mut index = mask(hash, shift) as usize;
-        while let Some(entry) = self.data.get(index) {
-            return match entry {
-                Entry::Value(ref value, value_hash) => {
-                    if hash_may_eq::<A>(hash, *value_hash) && key == value.extract_key().borrow() {
-                        Some(value)
-                    } else if !self.linear_probing {
-                        None
-                    } else {
-                        index = (index + 1) % HASH_WIDTH;
-                        continue;
-                    }
-                }
-                Entry::Collision(ref coll) => coll.get(key),
-                Entry::Node(ref child) => child.get(hash, shift + HASH_SHIFT, key),
-                Entry::SmallNode(ref small) => small.get(hash, shift + HASH_SHIFT, key),
-            };
-        }
-        None
-    }
-
-    pub(crate) fn get_mut<BK>(&mut self, hash: HashBits, shift: usize, key: &BK) -> Option<&mut A>
-    where
-        A: Clone,
-        BK: Eq + ?Sized,
-        A::Key: Borrow<BK>,
-    {
-        let this = self as *mut Self;
-        #[allow(dropping_references)]
-        drop(self); // prevent self from being used or moved, so it's is safe to dereference `this` later
-        let mut index = mask(hash, shift) as usize;
-        loop {
-            // Restore a mutable reference to self to avoid hitting the borrow checker
-            // limitation that prevents us from returning mutable references from the original
-            // `self` inside a loop. This is safe because we only restore the mutable reference
-            // once per iteration and the references goes out of scope at the end of the loop.
-            #[allow(unsafe_code)]
-            let this = unsafe { &mut *this };
-            return match this.data.get_mut(index) {
-                Some(Entry::Node(ref mut child_ref)) => {
-                    SharedPointer::make_mut(child_ref).get_mut(hash, shift + HASH_SHIFT, key)
-                }
-                Some(Entry::SmallNode(ref mut small_ref)) => {
-                    SharedPointer::make_mut(small_ref).get_mut(hash, shift + HASH_SHIFT, key)
-                }
-                Some(Entry::Value(ref mut value, value_hash)) => {
-                    if hash_may_eq::<A>(hash, *value_hash) && key == value.extract_key().borrow() {
-                        Some(value)
-                    } else if !this.linear_probing {
-                        None
-                    } else {
-                        index = (index + 1) % HASH_WIDTH;
-                        continue;
-                    }
-                }
-                Some(Entry::Collision(ref mut coll_ref)) => {
-                    SharedPointer::make_mut(coll_ref).get_mut(key)
-                }
-                None => None,
-            };
-        }
-    }
-
-    #[allow(unsafe_code)]
-    pub(crate) fn insert(&mut self, hash: HashBits, shift: usize, value: A) -> Option<A>
-    where
-        A: Clone,
-    {
-        let mut index = mask(hash, shift) as usize;
-        while let Some(entry) = self.data.get_mut(index) {
-            // Value is here
-            match entry {
-                // Update value or create a subtree
-                Entry::Value(ref mut current, current_hash) => {
-                    if hash_may_eq::<A>(hash, *current_hash)
-                        && current.extract_key() == value.extract_key()
-                    {
-                        return Some(mem::replace(current, value));
-                    }
-                    if self.linear_probing {
-                        index = (index + 1) % HASH_WIDTH;
-                        continue;
-                    }
-                }
-                // There's already a collision here.
-                Entry::Collision(ref mut collision) => {
-                    let coll = SharedPointer::make_mut(collision);
-                    return coll.insert(value);
-                }
-                Entry::Node(ref mut child_ref) => {
-                    // Child node
-                    let child = SharedPointer::make_mut(child_ref);
-                    return child.insert(hash, shift + HASH_SHIFT, value);
-                }
-                Entry::SmallNode(ref mut small_ref) => {
-                    // SmallNode - first check if we need to upgrade
-                    let small = SharedPointer::make_mut(small_ref);
-                    match small.insert(hash, shift + HASH_SHIFT, value) {
-                        Ok(result) => return result,
-                        Err(value) => {
-                            // It's a collision, need to upgrade to Node
-                            let mut node = Node::new();
-                            for entry in mem::take(&mut small.data) {
-                                if let Entry::Value(v, h) = entry {
-                                    node.insert(h, shift + HASH_SHIFT, v);
-                                } else {
-                                    unreachable!("SmallNode should only contain Values");
-                                }
-                            }
-
-                            // Insert the new value
-                            node.insert(hash, shift + HASH_SHIFT, value);
-                            *entry = Entry::Node(SharedPointer::new(node));
-                            return None;
-                        }
-                    }
-                }
-            }
-
-            // If we get here, we're inserting a value over an exiting value (collision).
-            // We're going to be unsafe and pry it out of the reference, trusting
-            // that we overwrite it with the merged node.
-            let Entry::Value(old_value, old_hash) = (unsafe { ptr::read(entry) }) else {
-                unreachable!()
-            };
-            let new_entry = if shift + HASH_SHIFT >= HASH_WIDTH {
-                // We're at the lowest level, need to set up a collision node.
-                let coll = CollisionNode::new(hash, old_value, value);
-                Entry::from(coll)
-            } else {
-                Node::merge_values(old_value, old_hash, value, hash, shift + HASH_SHIFT)
-            };
-            unsafe { ptr::write(entry, new_entry) };
-            return None;
-        }
-
-        if self.linear_probing && self.data.len() >= HASH_WIDTH / 2 {
-            self.linear_probing = false;
-            let old_data = mem::take(&mut self.data);
-            for entry in old_data.drain() {
-                if let Entry::Value(value, hash) = entry {
-                    self.insert(hash, shift, value);
-                } else {
-                    unreachable!("linear probing should only contain values")
-                }
-            }
-            return self.insert(hash, shift, value);
-        }
-        self.data.insert(index, Entry::Value(value, hash));
-        None
-    }
-
-    pub(crate) fn remove<BK>(&mut self, hash: HashBits, shift: usize, key: &BK) -> Option<A>
-    where
-        A: Clone,
-        BK: Eq + ?Sized,
-        A::Key: Borrow<BK>,
-    {
-        let mut index = mask(hash, shift) as usize;
-        // First find the entry to remove
-        loop {
-            match self.data.get(index) {
-                None => return None,
-                Some(Entry::Value(value, value_hash)) => {
-                    if hash_may_eq::<A>(hash, *value_hash) && key == value.extract_key().borrow() {
-                        break;
-                    } else if !self.linear_probing {
-                        return None;
-                    } else {
-                        index = (index + 1) % HASH_WIDTH;
-                    }
-                }
-                Some(Entry::Collision(_) | Entry::Node(_) | Entry::SmallNode(_)) => break,
-            }
-        }
-
-        let new_node;
-        let removed;
-        match self.data.get_mut(index).unwrap() {
-            Entry::Node(ref mut child_ref) => {
-                let child = SharedPointer::make_mut(child_ref);
-                match child.remove(hash, shift + HASH_SHIFT, key) {
-                    None => return None,
-                    Some(value) => {
-                        if child.len() == 1
-                            && child.data[child.data.first_index().unwrap()].is_value()
-                        {
-                            removed = Some(value);
-                            new_node = Some(child.pop());
-                        } else {
-                            return Some(value);
-                        }
-                    }
-                }
-            }
-            Entry::Value(..) => {
-                new_node = None;
-                removed = self.data.remove(index).map(Entry::unwrap_value);
-            }
-            Entry::Collision(ref mut coll_ref) => {
-                let coll = SharedPointer::make_mut(coll_ref);
-                removed = coll.remove(key);
-                if coll.len() == 1 {
-                    new_node = Some(coll.pop());
-                } else {
-                    return removed;
-                }
-            }
-            Entry::SmallNode(ref mut small_ref) => {
-                let small = SharedPointer::make_mut(small_ref);
-                match small.remove(hash, shift + HASH_SHIFT, key) {
-                    None => return None,
-                    Some(value) => {
-                        if small.len() == 1 {
-                            removed = Some(value);
-                            new_node = Some(small.pop());
-                        } else {
-                            return Some(value);
-                        }
-                    }
-                }
-            }
-        }
-
-        if let Some(node) = new_node {
-            self.data.insert(index, node);
-        } else if self.linear_probing {
-            // Perform backwards shift if using linear probing
-            let mut next = (index + 1) % HASH_WIDTH;
-            while let Some(Entry::Value(_, value_hash)) = self.data.get(next) {
-                let ideal_index = mask(*value_hash, shift) as usize;
-                let next_dib = next.wrapping_sub(ideal_index) % HASH_WIDTH;
-                let index_dib = index.wrapping_sub(ideal_index) % HASH_WIDTH;
-                if index_dib < next_dib {
-                    let entry = self.data.remove(next).unwrap();
-                    self.data.insert(index, entry);
-                    index = next;
-                }
-                next = (next + 1) % HASH_WIDTH;
-            }
-        }
-
-        removed
     }
 }
 
